@@ -11,3 +11,4 @@ python-swiftclient
 requests
 types-PyYAML
 types-requests
+websockets<14.0 # https://github.com/juju/python-libjuju/issues/1184
