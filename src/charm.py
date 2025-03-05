@@ -71,6 +71,7 @@ class WordpressCharm(CharmBase):
         "resource-centre",
         "thematic",
         "twentyeleven",
+        "twentytwentyfive",
         "twentytwentyfour",
         "twentytwentythree",
         "twentytwentytwo",

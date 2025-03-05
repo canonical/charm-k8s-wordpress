@@ -10,6 +10,7 @@ By default, the following WordPress themes are installed with the latest version
 - [twentytwenty](https://git.launchpad.net/~canonical-sysadmins/wordpress/+git/wp-theme-twentyeleven)
 - [twentytwentyone](https://git.launchpad.net/~canonical-sysadmins/wordpress/+git/wp-theme-twentyeleven)
 - [twentytwentytwo](https://git.launchpad.net/~canonical-sysadmins/wordpress/+git/wp-theme-twentyeleven)
+- [twentytwentyfive](https://downloads.wordpress.org/theme/twentytwentyfive.1.1.zip)
 - [ubuntu-cloud-website](https://git.launchpad.net/~canonical-sysadmins/ubuntu-cloud-website/+git/ubuntu-cloud-website)
 - [ubuntu-community-wordpress-theme/ubuntu-community](https://git.launchpad.net/~canonical-sysadmins/ubuntu-community-wordpress-theme/+git/ubuntu-community-wordpress-theme)
 - [ubuntu-community/ubuntu-community](https://git.launchpad.net/~canonical-sysadmins/wordpress/+git/wp-theme-ubuntu-community)

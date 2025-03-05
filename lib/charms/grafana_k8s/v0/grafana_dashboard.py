@@ -157,7 +157,7 @@ by adding itself as an observer for these events:
         self._on_dashboards_changed,
     )
 
-Dashboards can be retrieved the :meth:`dashboards`:
+Dashboards can be retrieved via the `dashboards` method:
 
 It will be returned in the format of:
 
@@ -175,7 +175,6 @@ It will be returned in the format of:
 The consuming charm should decompress the dashboard.
 """
 
-import base64
 import hashlib
 import json
 import logging
@@ -187,7 +186,7 @@ import subprocess
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import yaml
 from ops.charm import (
@@ -209,6 +208,7 @@ from ops.framework import (
     StoredState,
 )
 from ops.model import Relation
+from cosl import LZMABase64, DashboardPath40UID
 
 # The unique Charmhub library identifier, never change it
 LIBID = "c49eb9c7dfef40c7b6235ebd67010a3f"
@@ -219,7 +219,9 @@ LIBAPI = 0
 # Increment this PATCH version before using `charmcraft publish-lib` or reset
 # to 0 if you are raising the major API version
 
-LIBPATCH = 36
+LIBPATCH = 42
+
+PYDEPS = ["cosl >= 0.0.50"]
 
 logger = logging.getLogger(__name__)
 
@@ -415,8 +417,7 @@ class RelationInterfaceMismatchError(Exception):
         self.expected_relation_interface = expected_relation_interface
         self.actual_relation_interface = actual_relation_interface
         self.message = (
-            "The '{}' relation has '{}' as "
-            "interface rather than the expected '{}'".format(
+            "The '{}' relation has '{}' as " "interface rather than the expected '{}'".format(
                 relation_name, actual_relation_interface, expected_relation_interface
             )
         )
@@ -544,357 +545,486 @@ def _validate_relation_by_interface_and_direction(
         raise Exception("Unexpected RelationDirection: {}".format(expected_relation_role))
 
 
-def _encode_dashboard_content(content: Union[str, bytes]) -> str:
-    if isinstance(content, str):
-        content = bytes(content, "utf-8")
+class CharmedDashboard:
+    """A helper class for handling dashboards on the requirer (Grafana) side."""
 
-    return base64.b64encode(lzma.compress(content)).decode("utf-8")
+    @classmethod
+    def _convert_dashboard_fields(cls, content: str, inject_dropdowns: bool = True) -> str:
+        """Make sure values are present for Juju topology.
 
+        Inserts Juju topology variables and selectors into the template, as well as
+        a variable for Prometheus.
+        """
+        dict_content = json.loads(content)
+        datasources = {}
+        existing_templates = False
 
-def _decode_dashboard_content(encoded_content: str) -> str:
-    return lzma.decompress(base64.b64decode(encoded_content.encode("utf-8"))).decode()
+        template_dropdowns = (
+            TOPOLOGY_TEMPLATE_DROPDOWNS + DATASOURCE_TEMPLATE_DROPDOWNS  # type: ignore
+            if inject_dropdowns
+            else DATASOURCE_TEMPLATE_DROPDOWNS
+        )
 
+        # If the dashboard has __inputs, get the names to replace them. These are stripped
+        # from reactive dashboards in GrafanaDashboardAggregator, but charm authors in
+        # newer charms may import them directly from the marketplace
+        if "__inputs" in dict_content:
+            for field in dict_content["__inputs"]:
+                if "type" in field and field["type"] == "datasource":
+                    datasources[field["name"]] = field["pluginName"].lower()
+            del dict_content["__inputs"]
 
-def _convert_dashboard_fields(content: str, inject_dropdowns: bool = True) -> str:
-    """Make sure values are present for Juju topology.
-
-    Inserts Juju topology variables and selectors into the template, as well as
-    a variable for Prometheus.
-    """
-    dict_content = json.loads(content)
-    datasources = {}
-    existing_templates = False
-
-    template_dropdowns = (
-        TOPOLOGY_TEMPLATE_DROPDOWNS + DATASOURCE_TEMPLATE_DROPDOWNS  # type: ignore
-        if inject_dropdowns
-        else DATASOURCE_TEMPLATE_DROPDOWNS
-    )
-
-    # If the dashboard has __inputs, get the names to replace them. These are stripped
-    # from reactive dashboards in GrafanaDashboardAggregator, but charm authors in
-    # newer charms may import them directly from the marketplace
-    if "__inputs" in dict_content:
-        for field in dict_content["__inputs"]:
-            if "type" in field and field["type"] == "datasource":
-                datasources[field["name"]] = field["pluginName"].lower()
-        del dict_content["__inputs"]
-
-    # If no existing template variables exist, just insert our own
-    if "templating" not in dict_content:
-        dict_content["templating"] = {"list": list(template_dropdowns)}  # type: ignore
-    else:
-        # Otherwise, set a flag so we can go back later
-        existing_templates = True
-        for template_value in dict_content["templating"]["list"]:
-            # Build a list of `datasource_name`: `datasource_type` mappings
-            # The "query" field is actually "prometheus", "loki", "influxdb", etc
-            if "type" in template_value and template_value["type"] == "datasource":
-                datasources[template_value["name"]] = template_value["query"].lower()
-
-        # Put our own variables in the template
-        for d in template_dropdowns:  # type: ignore
-            if d not in dict_content["templating"]["list"]:
-                dict_content["templating"]["list"].insert(0, d)
-
-    dict_content = _replace_template_fields(dict_content, datasources, existing_templates)
-    return json.dumps(dict_content)
-
-
-def _replace_template_fields(  # noqa: C901
-    dict_content: dict, datasources: dict, existing_templates: bool
-) -> dict:
-    """Make templated fields get cleaned up afterwards.
-
-    If existing datasource variables are present, try to substitute them.
-    """
-    replacements = {"loki": "${lokids}", "prometheus": "${prometheusds}"}
-    used_replacements = []  # type: List[str]
-
-    # If any existing datasources match types we know, or we didn't find
-    # any templating variables at all, template them.
-    if datasources or not existing_templates:
-        panels = dict_content.get("panels", {})
-        if panels:
-            dict_content["panels"] = _template_panels(
-                panels, replacements, used_replacements, existing_templates, datasources
-            )
-
-        # Find panels nested under rows
-        rows = dict_content.get("rows", {})
-        if rows:
-            for row_idx, row in enumerate(rows):
-                if "panels" in row.keys():
-                    rows[row_idx]["panels"] = _template_panels(
-                        row["panels"],
-                        replacements,
-                        used_replacements,
-                        existing_templates,
-                        datasources,
-                    )
-
-            dict_content["rows"] = rows
-
-    # Finally, go back and pop off the templates we stubbed out
-    deletions = []
-    for tmpl in dict_content["templating"]["list"]:
-        if tmpl["name"] and tmpl["name"] in used_replacements:
-            deletions.append(tmpl)
-
-    for d in deletions:
-        dict_content["templating"]["list"].remove(d)
-
-    return dict_content
-
-
-def _template_panels(
-    panels: dict,
-    replacements: dict,
-    used_replacements: list,
-    existing_templates: bool,
-    datasources: dict,
-) -> dict:
-    """Iterate through a `panels` object and template it appropriately."""
-    # Go through all the panels. If they have a datasource set, AND it's one
-    # that we can convert to ${lokids} or ${prometheusds}, by stripping off the
-    # ${} templating and comparing the name to the list we built, replace it,
-    # otherwise, leave it alone.
-    #
-    for panel in panels:
-        if "datasource" not in panel or not panel.get("datasource"):
-            continue
-        if not existing_templates:
-            datasource = panel.get("datasource")
-            if isinstance(datasource, str):
-                if "loki" in datasource:
-                    panel["datasource"] = "${lokids}"
-                elif "grafana" in datasource:
-                    continue
-                else:
-                    panel["datasource"] = "${prometheusds}"
-            elif isinstance(datasource, dict):
-                # In dashboards exported by Grafana 9, datasource type is dict
-                dstype = datasource.get("type", "")
-                if dstype == "loki":
-                    panel["datasource"]["uid"] = "${lokids}"
-                elif dstype == "prometheus":
-                    panel["datasource"]["uid"] = "${prometheusds}"
-                else:
-                    logger.debug("Unrecognized datasource type '%s'; skipping", dstype)
-                    continue
-            else:
-                logger.error("Unknown datasource format: skipping")
-                continue
+        # If no existing template variables exist, just insert our own
+        if "templating" not in dict_content:
+            dict_content["templating"] = {"list": list(template_dropdowns)}  # type: ignore
         else:
-            if isinstance(panel["datasource"], str):
-                if panel["datasource"].lower() in replacements.values():
-                    # Already a known template variable
-                    continue
-                # Strip out variable characters and maybe braces
-                ds = re.sub(r"(\$|\{|\})", "", panel["datasource"])
+            # Otherwise, set a flag so we can go back later
+            existing_templates = True
+            for template_value in dict_content["templating"]["list"]:
+                # Build a list of `datasource_name`: `datasource_type` mappings
+                # The "query" field is actually "prometheus", "loki", "influxdb", etc
+                if "type" in template_value and template_value["type"] == "datasource":
+                    datasources[template_value["name"]] = template_value["query"].lower()
 
-                if ds not in datasources.keys():
-                    # Unknown, non-templated datasource, potentially a Grafana builtin
-                    continue
+            # Put our own variables in the template
+            for d in template_dropdowns:  # type: ignore
+                if d not in dict_content["templating"]["list"]:
+                    dict_content["templating"]["list"].insert(0, d)
 
-                replacement = replacements.get(datasources[ds], "")
-                if replacement:
-                    used_replacements.append(ds)
-                panel["datasource"] = replacement or panel["datasource"]
-            elif isinstance(panel["datasource"], dict):
-                dstype = panel["datasource"].get("type", "")
-                if panel["datasource"].get("uid", "").lower() in replacements.values():
-                    # Already a known template variable
-                    continue
-                # Strip out variable characters and maybe braces
-                ds = re.sub(r"(\$|\{|\})", "", panel["datasource"].get("uid", ""))
-
-                if ds not in datasources.keys():
-                    # Unknown, non-templated datasource, potentially a Grafana builtin
-                    continue
-
-                replacement = replacements.get(datasources[ds], "")
-                if replacement:
-                    used_replacements.append(ds)
-                    panel["datasource"]["uid"] = replacement
-            else:
-                logger.error("Unknown datasource format: skipping")
-                continue
-    return panels
-
-
-def _inject_labels(content: str, topology: dict, transformer: "CosTool") -> str:
-    """Inject Juju topology into panel expressions via CosTool.
-
-    A dashboard will have a structure approximating:
-        {
-            "__inputs": [],
-            "templating": {
-                "list": [
-                    {
-                        "name": "prometheusds",
-                        "type": "prometheus"
-                    }
-                ]
-            },
-            "panels": [
-                {
-                    "foo": "bar",
-                    "targets": [
-                        {
-                            "some": "field",
-                            "expr": "up{job="foo"}"
-                        },
-                        {
-                            "some_other": "field",
-                            "expr": "sum(http_requests_total{instance="$foo"}[5m])}
-                        }
-                    ],
-                    "datasource": "${someds}"
-                }
-            ]
-        }
-
-    `templating` is used elsewhere in this library, but the structure is not rigid. It is
-    not guaranteed that a panel will actually have any targets (it could be a "spacer" with
-    no datasource, hence no expression). It could have only one target. It could have multiple
-    targets. It could have multiple targets of which only one has an `expr` to evaluate. We need
-    to try to handle all of these concisely.
-
-    `cos-tool` (`github.com/canonical/cos-tool` as a Go module in general)
-    does not know "Grafana-isms", such as using `[$_variable]` to modify the query from the user
-    interface, so we add placeholders (as `5y`, since it must parse, but a dashboard looking for
-    five years for a panel query would be unusual).
-
-    Args:
-        content: dashboard content as a string
-        topology: a dict containing topology values
-        transformer: a 'CosTool' instance
-    Returns:
-        dashboard content with replaced values.
-    """
-    dict_content = json.loads(content)
-
-    if "panels" not in dict_content.keys():
+        dict_content = cls._replace_template_fields(dict_content, datasources, existing_templates)
         return json.dumps(dict_content)
 
-    # Go through all the panels and inject topology labels
-    # Panels may have more than one 'target' where the expressions live, so that must be
-    # accounted for. Additionally, `promql-transform` does not necessarily gracefully handle
-    # expressions with range queries including variables. Exclude these.
-    #
-    # It is not a certainty that the `datasource` field will necessarily reflect the type, so
-    # operate on all fields.
-    panels = dict_content["panels"]
-    topology_with_prefix = {"juju_{}".format(k): v for k, v in topology.items()}
+    @classmethod
+    def _replace_template_fields(  # noqa: C901
+        cls, dict_content: dict, datasources: dict, existing_templates: bool
+    ) -> dict:
+        """Make templated fields get cleaned up afterwards.
 
-    # We need to use an index so we can insert the changed element back later
-    for panel_idx, panel in enumerate(panels):
-        if not isinstance(panel, dict):
-            continue
+        If existing datasource variables are present, try to substitute them.
+        """
+        replacements = {"loki": "${lokids}", "prometheus": "${prometheusds}"}
+        used_replacements = []  # type: List[str]
 
-        # Use the index to insert it back in the same location
-        panels[panel_idx] = _modify_panel(panel, topology_with_prefix, transformer)
+        # If any existing datasources match types we know, or we didn't find
+        # any templating variables at all, template them.
+        if datasources or not existing_templates:
+            panels = dict_content.get("panels", {})
+            if panels:
+                dict_content["panels"] = cls._template_panels(
+                    panels, replacements, used_replacements, existing_templates, datasources
+                )
 
-    return json.dumps(dict_content)
+            # Find panels nested under rows
+            rows = dict_content.get("rows", {})
+            if rows:
+                for row_idx, row in enumerate(rows):
+                    if "panels" in row.keys():
+                        rows[row_idx]["panels"] = cls._template_panels(
+                            row["panels"],
+                            replacements,
+                            used_replacements,
+                            existing_templates,
+                            datasources,
+                        )
 
+                dict_content["rows"] = rows
 
-def _modify_panel(panel: dict, topology: dict, transformer: "CosTool") -> dict:
-    """Inject Juju topology into panel expressions via CosTool.
+        # Finally, go back and pop off the templates we stubbed out
+        deletions = []
+        for tmpl in dict_content["templating"]["list"]:
+            if tmpl["name"] and tmpl["name"] in used_replacements:
+                # it might happen that existing template var name is the same as the one we insert (i.e prometheusds or lokids)
+                # in that case, we want to pop the existing one only.
+                if tmpl not in DATASOURCE_TEMPLATE_DROPDOWNS:
+                    deletions.append(tmpl)
 
-    Args:
-        panel: a dashboard panel as a dict
-        topology: a dict containing topology values
-        transformer: a 'CosTool' instance
-    Returns:
-        the panel with injected values
-    """
-    if "targets" not in panel.keys():
+        for d in deletions:
+            dict_content["templating"]["list"].remove(d)
+
+        return dict_content
+
+    @classmethod
+    def _template_panels(
+        cls,
+        panels: dict,
+        replacements: dict,
+        used_replacements: list,
+        existing_templates: bool,
+        datasources: dict,
+    ) -> dict:
+        """Iterate through a `panels` object and template it appropriately."""
+        # Go through all the panels. If they have a datasource set, AND it's one
+        # that we can convert to ${lokids} or ${prometheusds}, by stripping off the
+        # ${} templating and comparing the name to the list we built, replace it,
+        # otherwise, leave it alone.
+        #
+        for panel in panels:
+            if "datasource" not in panel or not panel.get("datasource"):
+                continue
+            if not existing_templates:
+                datasource = panel.get("datasource")
+                if isinstance(datasource, str):
+                    if "loki" in datasource:
+                        panel["datasource"] = "${lokids}"
+                    elif "grafana" in datasource:
+                        continue
+                    else:
+                        panel["datasource"] = "${prometheusds}"
+                elif isinstance(datasource, dict):
+                    # In dashboards exported by Grafana 9, datasource type is dict
+                    dstype = datasource.get("type", "")
+                    if dstype == "loki":
+                        panel["datasource"]["uid"] = "${lokids}"
+                    elif dstype == "prometheus":
+                        panel["datasource"]["uid"] = "${prometheusds}"
+                    else:
+                        logger.debug("Unrecognized datasource type '%s'; skipping", dstype)
+                        continue
+                else:
+                    logger.error("Unknown datasource format: skipping")
+                    continue
+            else:
+                if isinstance(panel["datasource"], str):
+                    if panel["datasource"].lower() in replacements.values():
+                        # Already a known template variable
+                        continue
+                    # Strip out variable characters and maybe braces
+                    ds = re.sub(r"(\$|\{|\})", "", panel["datasource"])
+
+                    if ds not in datasources.keys():
+                        # Unknown, non-templated datasource, potentially a Grafana builtin
+                        continue
+
+                    replacement = replacements.get(datasources[ds], "")
+                    if replacement:
+                        used_replacements.append(ds)
+                    panel["datasource"] = replacement or panel["datasource"]
+                elif isinstance(panel["datasource"], dict):
+                    dstype = panel["datasource"].get("type", "")
+                    if panel["datasource"].get("uid", "").lower() in replacements.values():
+                        # Already a known template variable
+                        continue
+                    # Strip out variable characters and maybe braces
+                    ds = re.sub(r"(\$|\{|\})", "", panel["datasource"].get("uid", ""))
+
+                    if ds not in datasources.keys():
+                        # Unknown, non-templated datasource, potentially a Grafana builtin
+                        continue
+
+                    replacement = replacements.get(datasources[ds], "")
+                    if replacement:
+                        used_replacements.append(ds)
+                        panel["datasource"]["uid"] = replacement
+                else:
+                    logger.error("Unknown datasource format: skipping")
+                    continue
+        return panels
+
+    @classmethod
+    def _inject_labels(cls, content: str, topology: dict, transformer: "CosTool") -> str:
+        """Inject Juju topology into panel expressions via CosTool.
+
+        A dashboard will have a structure approximating:
+            {
+                "__inputs": [],
+                "templating": {
+                    "list": [
+                        {
+                            "name": "prometheusds",
+                            "type": "prometheus"
+                        }
+                    ]
+                },
+                "panels": [
+                    {
+                        "foo": "bar",
+                        "targets": [
+                            {
+                                "some": "field",
+                                "expr": "up{job="foo"}"
+                            },
+                            {
+                                "some_other": "field",
+                                "expr": "sum(http_requests_total{instance="$foo"}[5m])}
+                            }
+                        ],
+                        "datasource": "${someds}"
+                    }
+                ]
+            }
+
+        `templating` is used elsewhere in this library, but the structure is not rigid. It is
+        not guaranteed that a panel will actually have any targets (it could be a "spacer" with
+        no datasource, hence no expression). It could have only one target. It could have multiple
+        targets. It could have multiple targets of which only one has an `expr` to evaluate. We need
+        to try to handle all of these concisely.
+
+        `cos-tool` (`github.com/canonical/cos-tool` as a Go module in general)
+        does not know "Grafana-isms", such as using `[$_variable]` to modify the query from the user
+        interface, so we add placeholders (as `5y`, since it must parse, but a dashboard looking for
+        five years for a panel query would be unusual).
+
+        Args:
+            content: dashboard content as a string
+            topology: a dict containing topology values
+            transformer: a 'CosTool' instance
+        Returns:
+            dashboard content with replaced values.
+        """
+        dict_content = json.loads(content)
+
+        if "panels" not in dict_content.keys():
+            return json.dumps(dict_content)
+
+        # Go through all the panels and inject topology labels
+        # Panels may have more than one 'target' where the expressions live, so that must be
+        # accounted for. Additionally, `promql-transform` does not necessarily gracefully handle
+        # expressions with range queries including variables. Exclude these.
+        #
+        # It is not a certainty that the `datasource` field will necessarily reflect the type, so
+        # operate on all fields.
+        panels = dict_content["panels"]
+        topology_with_prefix = {"juju_{}".format(k): v for k, v in topology.items()}
+
+        # We need to use an index so we can insert the changed element back later
+        for panel_idx, panel in enumerate(panels):
+            if not isinstance(panel, dict):
+                continue
+
+            # Use the index to insert it back in the same location
+            panels[panel_idx] = cls._modify_panel(panel, topology_with_prefix, transformer)
+
+        return json.dumps(dict_content)
+
+    @classmethod
+    def _modify_panel(cls, panel: dict, topology: dict, transformer: "CosTool") -> dict:
+        """Inject Juju topology into panel expressions via CosTool.
+
+        Args:
+            panel: a dashboard panel as a dict
+            topology: a dict containing topology values
+            transformer: a 'CosTool' instance
+        Returns:
+            the panel with injected values
+        """
+        if "targets" not in panel.keys():
+            return panel
+
+        # Pre-compile a regular expression to grab values from inside of []
+        range_re = re.compile(r"\[(?P<value>.*?)\]")
+        # Do the same for any offsets
+        offset_re = re.compile(r"offset\s+(?P<value>-?\s*[$\w]+)")
+
+        known_datasources = {"${prometheusds}": "promql", "${lokids}": "logql"}
+
+        targets = panel["targets"]
+
+        # We need to use an index so we can insert the changed element back later
+        for idx, target in enumerate(targets):
+            # If there's no expression, we don't need to do anything
+            if "expr" not in target.keys():
+                continue
+            expr = target["expr"]
+
+            if "datasource" not in panel.keys():
+                continue
+
+            if isinstance(panel["datasource"], str):
+                if panel["datasource"] not in known_datasources:
+                    continue
+                querytype = known_datasources[panel["datasource"]]
+            elif isinstance(panel["datasource"], dict):
+                if panel["datasource"]["uid"] not in known_datasources:
+                    continue
+                querytype = known_datasources[panel["datasource"]["uid"]]
+            else:
+                logger.error("Unknown datasource format: skipping")
+                continue
+
+            # Capture all values inside `[]` into a list which we'll iterate over later to
+            # put them back in-order. Then apply the regex again and replace everything with
+            # `[5y]` so promql/parser will take it.
+            #
+            # Then do it again for offsets
+            range_values = [m.group("value") for m in range_re.finditer(expr)]
+            expr = range_re.sub(r"[5y]", expr)
+
+            offset_values = [m.group("value") for m in offset_re.finditer(expr)]
+            expr = offset_re.sub(r"offset 5y", expr)
+            # Retrieve the new expression (which may be unchanged if there were no label
+            # matchers in the expression, or if tt was unable to be parsed like logql. It's
+            # virtually impossible to tell from any datasource "name" in a panel what the
+            # actual type is without re-implementing a complete dashboard parser, but no
+            # harm will some from passing invalid promql -- we'll just get the original back.
+            #
+            replacement = transformer.inject_label_matchers(expr, topology, querytype)
+
+            if replacement == target["expr"]:
+                # promql-transform caught an error. Move on
+                continue
+
+            # Go back and substitute values in [] which were pulled out
+            # Enumerate with an index... again. The same regex is ok, since it will still match
+            # `[(.*?)]`, which includes `[5y]`, our placeholder
+            for i, match in enumerate(range_re.finditer(replacement)):
+                # Replace one-by-one, starting from the left. We build the string back with
+                # `str.replace(string_to_replace, replacement_value, count)`. Limit the count
+                # to one, since we are going through one-by-one through the list we saved earlier
+                # in `range_values`.
+                replacement = replacement.replace(
+                    "[{}]".format(match.group("value")),
+                    "[{}]".format(range_values[i]),
+                    1,
+                )
+
+            for i, match in enumerate(offset_re.finditer(replacement)):
+                # Replace one-by-one, starting from the left. We build the string back with
+                # `str.replace(string_to_replace, replacement_value, count)`. Limit the count
+                # to one, since we are going through one-by-one through the list we saved earlier
+                # in `range_values`.
+                replacement = replacement.replace(
+                    "offset {}".format(match.group("value")),
+                    "offset {}".format(offset_values[i]),
+                    1,
+                )
+
+            # Use the index to insert it back in the same location
+            targets[idx]["expr"] = replacement
+
+        panel["targets"] = targets
         return panel
 
-    # Pre-compile a regular expression to grab values from inside of []
-    range_re = re.compile(r"\[(?P<value>.*?)\]")
-    # Do the same for any offsets
-    offset_re = re.compile(r"offset\s+(?P<value>-?\s*[$\w]+)")
+    @classmethod
+    def _content_to_dashboard_object(
+        cls,
+        *,
+        charm_name,
+        content: str,
+        juju_topology: dict,
+        inject_dropdowns: bool = True,
+        dashboard_alt_uid: Optional[str] = None,
+    ) -> Dict:
+        """Helper method for keeping a consistent stored state schema for the dashboard and some metadata.
 
-    known_datasources = {"${prometheusds}": "promql", "${lokids}": "logql"}
+        Args:
+            charm_name: Charm name (although the aggregator passes the app name).
+            content: The compressed dashboard.
+            juju_topology: This is not actually used in the dashboards, but is present to provide a secondary
+              salt to ensure uniqueness in the dict keys in case individual charm units provide dashboards.
+            inject_dropdowns: Whether to auto-render topology dropdowns.
+            dashboard_alt_uid: Alternative uid used for dashboards added programmatically.
+        """
+        ret = {
+            "charm": charm_name,
+            "content": content,
+            "juju_topology": juju_topology if inject_dropdowns else {},
+            "inject_dropdowns": inject_dropdowns,
+        }
 
-    targets = panel["targets"]
+        if dashboard_alt_uid is not None:
+            ret["dashboard_alt_uid"] = dashboard_alt_uid
 
-    # We need to use an index so we can insert the changed element back later
-    for idx, target in enumerate(targets):
-        # If there's no expression, we don't need to do anything
-        if "expr" not in target.keys():
-            continue
-        expr = target["expr"]
+        return ret
 
-        if "datasource" not in panel.keys():
-            continue
+    @classmethod
+    def _generate_alt_uid(cls, charm_name: str, key: str) -> str:
+        """Generate alternative uid for dashboards.
 
-        if isinstance(panel["datasource"], str):
-            if panel["datasource"] not in known_datasources:
-                continue
-            querytype = known_datasources[panel["datasource"]]
-        elif isinstance(panel["datasource"], dict):
-            if panel["datasource"]["uid"] not in known_datasources:
-                continue
-            querytype = known_datasources[panel["datasource"]["uid"]]
+        Args:
+            charm_name: The name of the charm (not app; from metadata).
+            key: A string used (along with charm.meta.name) to build the hash uid.
+
+        Returns: A hash string.
+        """
+        raw_dashboard_alt_uid = "{}-{}".format(charm_name, key)
+        return hashlib.shake_256(raw_dashboard_alt_uid.encode("utf-8")).hexdigest(8)
+
+    @classmethod
+    def _replace_uid(
+        cls, *, dashboard_dict: dict, dashboard_path: Path, charm_dir: Path, charm_name: str
+    ):
+        # If we're running this from within an aggregator (such as grafana agent), then the uid was
+        # already rendered there, so we do not want to overwrite it with a uid generated from aggregator's info.
+        # We overwrite the uid only if it's not a valid "Path40" uid.
+        if not DashboardPath40UID.is_valid(original_uid := dashboard_dict.get("uid", "")):
+            rel_path = str(
+                dashboard_path.relative_to(charm_dir)
+                if dashboard_path.is_absolute()
+                else dashboard_path
+            )
+            dashboard_dict["uid"] = DashboardPath40UID.generate(charm_name, rel_path)
+            logger.debug(
+                "Processed dashboard '%s': replaced original uid '%s' with '%s'",
+                dashboard_path,
+                original_uid,
+                dashboard_dict["uid"],
+            )
         else:
-            logger.error("Unknown datasource format: skipping")
-            continue
-
-        # Capture all values inside `[]` into a list which we'll iterate over later to
-        # put them back in-order. Then apply the regex again and replace everything with
-        # `[5y]` so promql/parser will take it.
-        #
-        # Then do it again for offsets
-        range_values = [m.group("value") for m in range_re.finditer(expr)]
-        expr = range_re.sub(r"[5y]", expr)
-
-        offset_values = [m.group("value") for m in offset_re.finditer(expr)]
-        expr = offset_re.sub(r"offset 5y", expr)
-        # Retrieve the new expression (which may be unchanged if there were no label
-        # matchers in the expression, or if tt was unable to be parsed like logql. It's
-        # virtually impossible to tell from any datasource "name" in a panel what the
-        # actual type is without re-implementing a complete dashboard parser, but no
-        # harm will some from passing invalid promql -- we'll just get the original back.
-        #
-        replacement = transformer.inject_label_matchers(expr, topology, querytype)
-
-        if replacement == target["expr"]:
-            # promql-tranform caught an error. Move on
-            continue
-
-        # Go back and substitute values in [] which were pulled out
-        # Enumerate with an index... again. The same regex is ok, since it will still match
-        # `[(.*?)]`, which includes `[5y]`, our placeholder
-        for i, match in enumerate(range_re.finditer(replacement)):
-            # Replace one-by-one, starting from the left. We build the string back with
-            # `str.replace(string_to_replace, replacement_value, count)`. Limit the count
-            # to one, since we are going through one-by-one through the list we saved earlier
-            # in `range_values`.
-            replacement = replacement.replace(
-                "[{}]".format(match.group("value")),
-                "[{}]".format(range_values[i]),
-                1,
+            logger.debug(
+                "Processed dashboard '%s': kept original uid '%s'", dashboard_path, original_uid
             )
 
-        for i, match in enumerate(offset_re.finditer(replacement)):
-            # Replace one-by-one, starting from the left. We build the string back with
-            # `str.replace(string_to_replace, replacement_value, count)`. Limit the count
-            # to one, since we are going through one-by-one through the list we saved earlier
-            # in `range_values`.
-            replacement = replacement.replace(
-                "offset {}".format(match.group("value")),
-                "offset {}".format(offset_values[i]),
-                1,
+    @classmethod
+    def _add_tags(cls, dashboard_dict: dict, charm_name: str):
+        tags: List[str] = dashboard_dict.get("tags", [])
+        if not any(tag.startswith("charm: ") for tag in tags):
+            tags.append(f"charm: {charm_name}")
+        dashboard_dict["tags"] = tags
+
+    @classmethod
+    def load_dashboards_from_dir(
+        cls,
+        *,
+        dashboards_path: Path,
+        charm_name: str,
+        charm_dir: Path,
+        inject_dropdowns: bool,
+        juju_topology: dict,
+        path_filter: Callable[[Path], bool] = lambda p: True,
+    ) -> dict:
+        """Load dashboards files from directory into a mapping from "dashboard id" to a so-called "dashboard object"."""
+
+        # Path.glob uses fnmatch on the backend, which is pretty limited, so use a
+        # custom function for the filter
+        def _is_dashboard(p: Path) -> bool:
+            return (
+                p.is_file()
+                and p.name.endswith((".json", ".json.tmpl", ".tmpl"))
+                and path_filter(p)
             )
 
-        # Use the index to insert it back in the same location
-        targets[idx]["expr"] = replacement
+        dashboard_templates = {}
 
-    panel["targets"] = targets
-    return panel
+        for path in filter(_is_dashboard, Path(dashboards_path).glob("*")):
+            try:
+                dashboard_dict = json.loads(path.read_bytes())
+            except json.JSONDecodeError as e:
+                logger.error("Failed to load dashboard '%s': %s", path, e)
+                continue
+            if type(dashboard_dict) is not dict:
+                logger.error(
+                    "Invalid dashboard '%s': expected dict, got %s", path, type(dashboard_dict)
+                )
+
+            cls._replace_uid(
+                dashboard_dict=dashboard_dict,
+                dashboard_path=path,
+                charm_dir=charm_dir,
+                charm_name=charm_name,
+            )
+
+            cls._add_tags(dashboard_dict=dashboard_dict, charm_name=charm_name)
+
+            id = "file:{}".format(path.stem)
+            dashboard_templates[id] = cls._content_to_dashboard_object(
+                charm_name=charm_name,
+                content=LZMABase64.compress(json.dumps(dashboard_dict)),
+                dashboard_alt_uid=cls._generate_alt_uid(charm_name, id),
+                inject_dropdowns=inject_dropdowns,
+                juju_topology=juju_topology,
+            )
+
+        return dashboard_templates
 
 
 def _type_convert_stored(obj):
@@ -1075,16 +1205,19 @@ class GrafanaDashboardProvider(Object):
         # that the stored state is there when this unit becomes leader.
         stored_dashboard_templates: Any = self._stored.dashboard_templates  # pyright: ignore
 
-        encoded_dashboard = _encode_dashboard_content(content)
+        encoded_dashboard = LZMABase64.compress(content)
 
         # Use as id the first chars of the encoded dashboard, so that
         # it is predictable across units.
         id = "prog:{}".format(encoded_dashboard[-24:-16])
 
-        stored_dashboard_templates[id] = self._content_to_dashboard_object(
-            encoded_dashboard, inject_dropdowns
+        stored_dashboard_templates[id] = CharmedDashboard._content_to_dashboard_object(
+            charm_name=self._charm.meta.name,
+            content=encoded_dashboard,
+            dashboard_alt_uid=CharmedDashboard._generate_alt_uid(self._charm.meta.name, id),
+            inject_dropdowns=inject_dropdowns,
+            juju_topology=self._juju_topology,
         )
-        stored_dashboard_templates[id]["dashboard_alt_uid"] = self._generate_alt_uid(id)
 
         if self._charm.unit.is_leader():
             for dashboard_relation in self._charm.model.relations[self._relation_name]:
@@ -1127,38 +1260,22 @@ class GrafanaDashboardProvider(Object):
                 if dashboard_id.startswith("file:"):
                     del stored_dashboard_templates[dashboard_id]
 
-            # Path.glob uses fnmatch on the backend, which is pretty limited, so use a
-            # custom function for the filter
-            def _is_dashboard(p: Path) -> bool:
-                return p.is_file() and p.name.endswith((".json", ".json.tmpl", ".tmpl"))
-
-            for path in filter(_is_dashboard, Path(self._dashboards_path).glob("*")):
-                # path = Path(path)
-                id = "file:{}".format(path.stem)
-                stored_dashboard_templates[id] = self._content_to_dashboard_object(
-                    _encode_dashboard_content(path.read_bytes()), inject_dropdowns
+            stored_dashboard_templates.update(
+                CharmedDashboard.load_dashboards_from_dir(
+                    dashboards_path=Path(self._dashboards_path),
+                    charm_name=self._charm.meta.name,
+                    charm_dir=self._charm.charm_dir,
+                    inject_dropdowns=inject_dropdowns,
+                    juju_topology=self._juju_topology,
                 )
-                stored_dashboard_templates[id]["dashboard_alt_uid"] = self._generate_alt_uid(id)
-
-            self._stored.dashboard_templates = stored_dashboard_templates
+            )
 
             if self._charm.unit.is_leader():
                 for dashboard_relation in self._charm.model.relations[self._relation_name]:
                     self._upset_dashboards_on_relation(dashboard_relation)
 
-    def _generate_alt_uid(self, key: str) -> str:
-        """Generate alternative uid for dashboards.
-
-        Args:
-            key: A string used (along with charm.meta.name) to build the hash uid.
-
-        Returns: A hash string.
-        """
-        raw_dashboard_alt_uid = "{}-{}".format(self._charm.meta.name, key)
-        return hashlib.shake_256(raw_dashboard_alt_uid.encode("utf-8")).hexdigest(8)
-
     def _reinitialize_dashboard_data(self, inject_dropdowns: bool = True) -> None:
-        """Triggers a reload of dashboard outside of an eventing workflow.
+        """Triggers a reload of dashboard outside an eventing workflow.
 
         Args:
             inject_dropdowns: a :bool: used to indicate whether topology dropdowns should be added
@@ -1231,17 +1348,6 @@ class GrafanaDashboardProvider(Object):
 
         relation.data[self._charm.app]["dashboards"] = json.dumps(stored_data)
 
-    def _content_to_dashboard_object(self, content: str, inject_dropdowns: bool = True) -> Dict:
-        return {
-            "charm": self._charm.meta.name,
-            "content": content,
-            "juju_topology": self._juju_topology if inject_dropdowns else {},
-            "inject_dropdowns": inject_dropdowns,
-        }
-
-    # This is not actually used in the dashboards, but is present to provide a secondary
-    # salt to ensure uniqueness in the dict keys in case individual charm units provide
-    # dashboards
     @property
     def _juju_topology(self) -> Dict:
         return {
@@ -1306,7 +1412,7 @@ class GrafanaDashboardConsumer(Object):
         super().__init__(charm, relation_name)
         self._charm = charm
         self._relation_name = relation_name
-        self._tranformer = CosTool(self._charm)
+        self._transformer = CosTool(self._charm)
 
         self._stored.set_default(dashboards={})  # type: ignore
 
@@ -1436,21 +1542,21 @@ class GrafanaDashboardConsumer(Object):
             error = None
             topology = template.get("juju_topology", {})
             try:
-                content = _decode_dashboard_content(template["content"])
+                content = LZMABase64.decompress(template["content"])
                 inject_dropdowns = template.get("inject_dropdowns", True)
                 content = self._manage_dashboard_uid(content, template)
-                content = _convert_dashboard_fields(content, inject_dropdowns)
+                content = CharmedDashboard._convert_dashboard_fields(content, inject_dropdowns)
 
                 if topology:
-                    content = _inject_labels(content, topology, self._tranformer)
+                    content = CharmedDashboard._inject_labels(content, topology, self._transformer)
 
-                content = _encode_dashboard_content(content)
+                content = LZMABase64.compress(content)
             except lzma.LZMAError as e:
                 error = str(e)
                 relation_has_invalid_dashboards = True
             except json.JSONDecodeError as e:
                 error = str(e.msg)
-                logger.warning("Invalid JSON in Grafana dashboard: {}".format(fname))
+                logger.warning("Invalid JSON in Grafana dashboard '{}': {}".format(fname, error))
                 continue
 
             # Prepend the relation name and ID to the dashboard ID to avoid clashes with
@@ -1506,7 +1612,7 @@ class GrafanaDashboardConsumer(Object):
 
         if not coerced_data == stored_data:
             stored_dashboards = self.get_peer_data("dashboards")
-            stored_dashboards[relation.id] = stored_data
+            stored_dashboards[str(relation.id)] = stored_data
             self.set_peer_data("dashboards", stored_dashboards)
             return True
         return None  # type: ignore
@@ -1533,7 +1639,7 @@ class GrafanaDashboardConsumer(Object):
             "id": dashboard["original_id"],
             "relation_id": relation_id,
             "charm": dashboard["template"]["charm"],
-            "content": _decode_dashboard_content(dashboard["content"]),
+            "content": LZMABase64.decompress(dashboard["content"]),
         }
 
     @property
@@ -1570,8 +1676,10 @@ class GrafanaDashboardConsumer(Object):
 
     def get_peer_data(self, key: str) -> Any:
         """Retrieve information from the peer data bucket instead of `StoredState`."""
-        data = self._charm.peers.data[self._charm.app].get(key, "")  # type: ignore[attr-defined]
-        return json.loads(data) if data else {}
+        if rel := self._charm.peers:  # type: ignore[attr-defined]
+            data = rel.data[self._charm.app].get(key, "")
+            return json.loads(data) if data else {}
+        return {}
 
 
 class GrafanaDashboardAggregator(Object):
@@ -1662,8 +1770,11 @@ class GrafanaDashboardAggregator(Object):
             return
 
         for id in dashboards:
-            self._stored.dashboard_templates[id] = self._content_to_dashboard_object(  # type: ignore
-                dashboards[id], event
+            self._stored.dashboard_templates[id] = CharmedDashboard._content_to_dashboard_object(  # type: ignore
+                charm_name=event.app.name,
+                content=dashboards[id],
+                inject_dropdowns=True,
+                juju_topology=self._hybrid_topology(event),
             )
 
         self._stored.id_mappings[event.app.name] = dashboards  # type: ignore
@@ -1824,7 +1935,7 @@ class GrafanaDashboardAggregator(Object):
 
             from jinja2 import DebugUndefined, Template
 
-            content = _encode_dashboard_content(
+            content = LZMABase64.compress(
                 Template(dash, undefined=DebugUndefined).render(datasource=r"${prometheusds}")  # type: ignore
             )
             id = "prog:{}".format(content[-24:-16])
@@ -1855,32 +1966,20 @@ class GrafanaDashboardAggregator(Object):
             )
 
         if dashboards_path:
-
-            def is_dashboard(p: Path) -> bool:
-                return p.is_file() and p.name.endswith((".json", ".json.tmpl", ".tmpl"))
-
-            for path in filter(is_dashboard, Path(dashboards_path).glob("*")):
-                # path = Path(path)
-                if event.app.name in path.name:  # type: ignore
-                    id = "file:{}".format(path.stem)
-                    builtins[id] = self._content_to_dashboard_object(
-                        _encode_dashboard_content(path.read_bytes()), event
-                    )
+            builtins.update(
+                CharmedDashboard.load_dashboards_from_dir(
+                    dashboards_path=Path(dashboards_path),
+                    charm_name=event.app.name,
+                    charm_dir=self._charm.charm_dir,
+                    inject_dropdowns=True,
+                    juju_topology=self._hybrid_topology(event),
+                    path_filter=lambda path: event.app.name in path.name,
+                )
+            )
 
         return builtins
 
-    def _content_to_dashboard_object(self, content: str, event: RelationEvent) -> Dict:
-        return {
-            "charm": event.app.name,  # type: ignore
-            "content": content,
-            "juju_topology": self._juju_topology(event),
-            "inject_dropdowns": True,
-        }
-
-    # This is not actually used in the dashboards, but is present to provide a secondary
-    # salt to ensure uniqueness in the dict keys in case individual charm units provide
-    # dashboards
-    def _juju_topology(self, event: RelationEvent) -> Dict:
+    def _hybrid_topology(self, event: RelationEvent) -> Dict:
         return {
             "model": self._charm.model.name,
             "model_uuid": self._charm.model.uuid,
@@ -1999,12 +2098,9 @@ class CosTool:
         arch = "amd64" if arch == "x86_64" else arch
         res = "cos-tool-{}".format(arch)
         try:
-            path = Path(res).resolve()
-            path.chmod(0o777)
+            path = Path(res).resolve(strict=True)
             return path
-        except NotImplementedError:
-            logger.debug("System lacks support for chmod")
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             logger.debug('Could not locate cos-tool at: "{}"'.format(res))
         return None
 

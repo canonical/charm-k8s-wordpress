@@ -331,7 +331,7 @@ LIBAPI = 0
 
 # Increment this PATCH version before using `charmcraft publish-lib` or reset
 # to 0 if you are raising the major API version
-LIBPATCH = 39
+LIBPATCH = 41
 
 PYDEPS = ["ops>=2.0.0"]
 
@@ -389,6 +389,10 @@ class SecretsIllegalUpdateError(SecretError):
 
 class IllegalOperationError(DataInterfacesError):
     """To be used when an operation is not allowed to be performed."""
+
+
+class PrematureDataAccessError(DataInterfacesError):
+    """To be raised when the Relation Data may be accessed (written) before protocol init complete."""
 
 
 ##############################################################################
@@ -605,7 +609,7 @@ SECRET_GROUPS = SecretGroupsAggregate()
 class CachedSecret:
     """Locally cache a secret.
 
-    The data structure is precisely re-using/simulating as in the actual Secret Storage
+    The data structure is precisely reusing/simulating as in the actual Secret Storage
     """
 
     KNOWN_MODEL_ERRORS = [MODEL_ERRORS["no_label_and_uri"], MODEL_ERRORS["owner_no_refresh"]]
@@ -1453,6 +1457,8 @@ class EventHandlers(Object):
 class ProviderData(Data):
     """Base provides-side of the data products relation."""
 
+    RESOURCE_FIELD = "database"
+
     def __init__(
         self,
         model: Model,
@@ -1618,6 +1624,15 @@ class ProviderData(Data):
     def _update_relation_data(self, relation: Relation, data: Dict[str, str]) -> None:
         """Set values for fields not caring whether it's a secret or not."""
         req_secret_fields = []
+
+        keys = set(data.keys())
+        if self.fetch_relation_field(relation.id, self.RESOURCE_FIELD) is None and (
+            keys - {"endpoints", "read-only-endpoints", "replset"}
+        ):
+            raise PrematureDataAccessError(
+                "Premature access to relation data, update is forbidden before the connection is initialized."
+            )
+
         if relation.app:
             req_secret_fields = get_encoded_list(relation, relation.app, REQ_SECRET_FIELDS)
 
@@ -2348,7 +2363,6 @@ class DataPeerData(RequirerData, ProviderData):
     def _delete_relation_data(self, relation: Relation, fields: List[str]) -> None:
         """Delete data available (directily or indirectly -- i.e. secrets) from the relation for owner/this_app."""
         if self.secret_fields and self.deleted_label:
-
             _, normal_fields = self._process_secret_fields(
                 relation,
                 self.secret_fields,
@@ -3290,6 +3304,8 @@ class KafkaRequiresEvents(CharmEvents):
 class KafkaProviderData(ProviderData):
     """Provider-side of the Kafka relation."""
 
+    RESOURCE_FIELD = "topic"
+
     def __init__(self, model: Model, relation_name: str) -> None:
         super().__init__(model, relation_name)
 
@@ -3538,6 +3554,8 @@ class OpenSearchRequiresEvents(CharmEvents):
 
 class OpenSearchProvidesData(ProviderData):
     """Provider-side of the OpenSearch relation."""
+
+    RESOURCE_FIELD = "index"
 
     def __init__(self, model: Model, relation_name: str) -> None:
         super().__init__(model, relation_name)

@@ -24,3 +24,5 @@ jobs:
       setup-devstack-swift: true
       trivy-image-config: ./trivy.yaml
       channel: 1.31/stable
+      tmate-debug: true
+      tmate-timeout: 60
